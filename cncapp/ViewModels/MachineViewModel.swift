@@ -27,8 +27,12 @@ final class LogStore: ObservableObject {
 
 @MainActor
 final class MachineViewModel: ObservableObject {
+    private static let reconnectAttempts = 3
+    private static let reconnectDelay: Duration = .seconds(5)
+
     @Published private(set) var status = MachineStatus.disconnected
     @Published private(set) var connection: ServerConnection = .connecting
+    @Published private(set) var positionReceivedAt: Date?
     let logStore = LogStore()
     @Published var isUploading = false
     @Published var lastError: String?
@@ -68,6 +72,8 @@ final class MachineViewModel: ObservableObject {
 
     private var client: CNCAPIClient
     private var eventClient: SSEClient?
+    private var reconnectTask: Task<Void, Never>?
+    private var retriesRemaining = 0
     private var jogTask: Task<Void, Never>?
     private var jogRepeated = false
     private var lastLogID: Int64 = 0
@@ -84,19 +90,23 @@ final class MachineViewModel: ObservableObject {
 
     deinit {
         eventClient?.stop()
+        reconnectTask?.cancel()
         jogTask?.cancel()
     }
 
     func connect() {
-        generation = UUID()
-        eventClient?.stop()
-        eventClient = nil
-        status.connected = false
-        connection = .connecting
+        disconnect()
         startEventStream()
     }
 
     func disconnect() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        retriesRemaining = 0
+        closeEventStream()
+    }
+
+    private func closeEventStream() {
         generation = UUID()
         eventClient?.stop()
         eventClient = nil
@@ -117,6 +127,7 @@ final class MachineViewModel: ObservableObject {
             client = CNCAPIClient(baseURL: url)
             lastLogID = 0
             serverBoot = 0
+            positionReceivedAt = nil
             logStore.clear()
         }
         connect()
@@ -179,19 +190,25 @@ final class MachineViewModel: ObservableObject {
     func home() async { await perform(path: "/api/home", action: "хоминг") }
     func zero() async { await perform(path: "/api/zero", action: "обнуление координат") }
 
-    func updateStep(_ value: Double) async {
+    func updateStep(_ value: Double) async -> Bool {
         await perform(path: "/api/settings", json: ["step": min(max(value, 0.1), 50)], action: "изменение шага")
     }
 
-    func updateFeedXY(_ value: Double) async {
+    func updateFeedXY(_ value: Double) async -> Bool {
         await perform(path: "/api/settings", json: ["feedXY": min(max(value, 1), 300)], action: "изменение скорости X/Y")
     }
 
-    func updateFeedZ(_ value: Double) async {
+    func updateFeedZ(_ value: Double) async -> Bool {
         await perform(path: "/api/settings", json: ["feedZ": min(max(value, 1), 300)], action: "изменение скорости Z")
     }
 
+    var canUploadProgram: Bool {
+        (connection == .connected || connection == .controllerOffline) &&
+        !isUploading && !status.program.running
+    }
+
     func uploadProgram(from url: URL) async {
+        guard canUploadProgram else { return }
         guard url.startAccessingSecurityScopedResource() else {
             lastError = "Не удалось получить доступ к выбранному файлу"
             return
@@ -228,27 +245,30 @@ final class MachineViewModel: ObservableObject {
         }
     }
 
+    @discardableResult
     private func perform(
         path: String,
         json: [String: Any] = [:],
         action: String,
         silent: Bool = false
-    ) async {
+    ) async -> Bool {
         do {
             try await client.post(path, json: json)
+            return true
         } catch {
             if !silent { report(error, action: action) }
+            return false
         }
     }
 
     private func startEventStream() {
-        guard let baseURL = URL(string: serverAddress),
-              let eventsURL = URL(string: "/api/events", relativeTo: baseURL)?.absoluteURL else {
+        guard let eventsURL = URL(string: "/api/events", relativeTo: client.baseURL)?.absoluteURL else {
             lastError = "Некорректный адрес сервера"
             connection = .serverOffline
             return
         }
 
+        connection = .connecting
         generation = UUID()
         let currentGeneration = generation
         let stream = SSEClient()
@@ -258,10 +278,10 @@ final class MachineViewModel: ObservableObject {
                 self.receive(event: event, data: data)
             }
         }
-        stream.onDisconnect = { [weak self] error in
+        stream.onDisconnect = { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == currentGeneration else { return }
-                self.handleDisconnect(error)
+                self.handleDisconnect()
             }
         }
         eventClient = stream
@@ -285,6 +305,8 @@ final class MachineViewModel: ObservableObject {
             logStore.append(entry)
         case "status":
             guard let newStatus = try? JSONDecoder().decode(MachineStatus.self, from: payload) else { return }
+            retriesRemaining = Self.reconnectAttempts
+            if newStatus.hasPosition { positionReceivedAt = Date() }
             status = newStatus
             connection = newStatus.connected ? .connected : .controllerOffline
         default:
@@ -292,13 +314,22 @@ final class MachineViewModel: ObservableObject {
         }
     }
 
-    private func handleDisconnect(_ error: Error?) {
-        generation = UUID()
-        connection = .serverOffline
-        status.connected = false
+    private func handleDisconnect() {
+        closeEventStream()
         endJog()
-        eventClient?.stop()
-        eventClient = nil
+        guard retriesRemaining > 0 else { return }
+
+        reconnectTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: Self.reconnectDelay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.reconnectTask = nil
+            self.retriesRemaining -= 1
+            self.startEventStream()
+        }
     }
 
     private func report(_ error: Error, action: String) {

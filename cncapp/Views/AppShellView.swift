@@ -10,11 +10,6 @@ struct AppShellView: View {
 
             ProgramView()
                 .tabItem { Label("G-code", systemImage: "doc.text") }
-
-            LogsView()
-                .environmentObject(machine.logStore)
-                .tabItem { Label("Журнал", systemImage: "list.bullet.rectangle") }
-
         }
         .tint(.blue)
         .alert("Ошибка", isPresented: errorBinding) {

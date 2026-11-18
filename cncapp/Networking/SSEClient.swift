@@ -17,11 +17,11 @@ final class SSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendable {
         lock.withLock { stopped = false }
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.timeoutInterval = .infinity
+        request.timeoutInterval = 15
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = .infinity
+        configuration.timeoutIntervalForRequest = request.timeoutInterval
         configuration.timeoutIntervalForResource = .infinity
         let newSession = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
         session = newSession

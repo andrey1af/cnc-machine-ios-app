@@ -4,26 +4,25 @@ import UniformTypeIdentifiers
 struct ProgramView: View {
     @EnvironmentObject private var machine: MachineViewModel
     @State private var isImporterPresented = false
-    @State private var confirmation: ProgramConfirmation?
+    @State private var startReview: ProgramStartReview?
+    @State private var showCancelConfirmation = false
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
                     programCard
-                    toolpathCard
                     controlsCard
-                    guidanceCard
+                    toolpathCard
                 }
                 .padding()
             }
+            .safeAreaInset(edge: .top, spacing: 0) { MachineStatusPanel() }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("G-code")
             .task(id: machine.previewKey) { await machine.loadPreview() }
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    ConnectionMenuButton()
-                }
+                ConnectionToolbarItem()
             }
             .fileImporter(
                 isPresented: $isImporterPresented,
@@ -33,33 +32,30 @@ struct ProgramView: View {
                 guard case .success(let urls) = result, let url = urls.first else { return }
                 Task { await machine.uploadProgram(from: url) }
             }
+            .sheet(item: $startReview) { review in
+                startConfirmation(for: review)
+            }
             .confirmationDialog(
-                confirmation?.title ?? "",
-                isPresented: Binding(
-                    get: { confirmation != nil },
-                    set: { if !$0 { confirmation = nil } }
-                ),
+                "Отменить выполнение?",
+                isPresented: $showCancelConfirmation,
                 titleVisibility: .visible
             ) {
-                if let confirmation {
-                    Button(confirmation.actionTitle, role: confirmation.role) {
-                        run(confirmation)
-                    }
+                Button("Отменить программу", role: .destructive) {
+                    Task { await machine.cancelProgram() }
                 }
                 Button("Отмена", role: .cancel) {}
             } message: {
-                Text(confirmation?.message ?? "")
+                Text("Станок плавно остановится, буфер движения будет очищен. Координаты сохранятся.")
             }
         }
     }
 
     private var programCard: some View {
-        Panel("Текущая программа") {
+        Panel("Текущая программа", help: "Поддерживаются файлы G-code до 10 МБ. Оценка времени обновляется раз в минуту, когда по координатам можно определить прогресс.") {
             if machine.status.program.name.isEmpty {
                 ContentUnavailableView(
                     "Файл не выбран",
-                    systemImage: "doc.badge.plus",
-                    description: Text("Выберите G-code объёмом до 10 МБ")
+                    systemImage: "doc.badge.plus"
                 )
                 .frame(maxWidth: .infinity)
             } else {
@@ -94,7 +90,7 @@ struct ProgramView: View {
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                     } else if program.running {
-                        Text("Оценка оставшегося времени появится после первой минуты и определения текущей строки")
+                        Text("Осталось: —")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -118,12 +114,15 @@ struct ProgramView: View {
                 }
             }
             .buttonStyle(.bordered)
-            .disabled(machine.isUploading || machine.status.program.running || machine.connection == .serverOffline)
+            .disabled(!machine.canUploadProgram)
         }
     }
 
     private var toolpathCard: some View {
-        Panel("Траектория 2.5D") {
+        Panel(
+            "Траектория 2.5D",
+            help: "Зелёный — пройдено. Оранжевый — текущая строка. Красная точка — инструмент. Пунктир — G0.\n\nТекущая строка определяется приблизительно. Начальные режимы: G21 G90 G17. Высота — Z, размеры — мм."
+        ) {
             ToolpathView(preview: machine.preview,
                          cacheKey: "\(machine.previewKey)-\(machine.previewRenderVersion)", status: machine.status,
                          online: machine.connection == .connected)
@@ -137,7 +136,11 @@ struct ProgramView: View {
     private var controlsCard: some View {
         Panel("Управление выполнением") {
             Button {
-                confirmation = .start(machine.status.program)
+                startReview = ProgramStartReview(
+                    program: machine.status.program,
+                    workPosition: startPositionText,
+                    previewKey: machine.previewKey
+                )
             } label: {
                 Label("Старт", systemImage: "play.fill")
                     .frame(maxWidth: .infinity)
@@ -166,7 +169,7 @@ struct ProgramView: View {
             }
 
             Button(role: .destructive) {
-                confirmation = .cancel
+                showCancelConfirmation = true
             } label: {
                 Label("Отменить программу", systemImage: "stop.fill")
                     .frame(maxWidth: .infinity)
@@ -176,19 +179,54 @@ struct ProgramView: View {
         }
     }
 
-    private var guidanceCard: some View {
-        Panel("Перед запуском") {
-            Label("Установите фрезу в начальную точку", systemImage: "1.circle.fill")
-            Label("Обнулите рабочие координаты на вкладке «Пульт»", systemImage: "2.circle.fill")
-            Label("Проверьте крепление заготовки и нажмите «Старт»", systemImage: "3.circle.fill")
+    private func startConfirmation(for review: ProgramStartReview) -> some View {
+        NavigationStack {
+            Form {
+                Section("Выбранная программа") {
+                    Text(review.program.name)
+                    LabeledContent("Строк", value: review.program.lines.formatted())
+                }
+                Section("Обязательные действия") {
+                    Text("1. Проверьте крепление заготовки.")
+                    Text("2. Установите фрезу в начальную точку.")
+                    Text("3. Обнулите рабочие координаты XYZ в этой точке.")
+                }
+                Section("Рабочие координаты (WPos), мм") {
+                    Text(review.workPosition ?? "Рабочие координаты недоступны")
+                        .monospacedDigit()
+                }
+                Section {
+                    Button("Подтвердить и запустить") {
+                        guard canStart, review.previewKey == machine.previewKey else { return }
+                        startReview = nil
+                        Task { await machine.startProgram() }
+                    }
+                    .disabled(!canStart || review.previewKey != machine.previewKey)
+                }
+            }
+            .navigationTitle("Запуск G-code")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Отмена") { startReview = nil }
+                }
+            }
         }
-        .font(.subheadline)
     }
 
     private var canStart: Bool {
         machine.status.connected &&
         !machine.status.program.name.isEmpty &&
         !machine.status.program.running
+    }
+
+    private var startPositionText: String? {
+        let status = machine.status
+        guard status.hasPosition, status.posLabel == "WPos" else { return nil }
+        let axes = Axis.allCases.map { "\($0.rawValue) \(status.coordinateText(for: $0))" }
+        let position = axes.joined(separator: "\n")
+        guard let receivedAt = machine.positionReceivedAt else { return position }
+        return "\(position)\nПолучено в \(receivedAt.formatted(date: .omitted, time: .standard))"
     }
 
     private var programColor: Color {
@@ -199,51 +237,14 @@ struct ProgramView: View {
         default: return .secondary
         }
     }
-
-    private func run(_ action: ProgramConfirmation) {
-        confirmation = nil
-        switch action {
-        case .start:
-            Task { await machine.startProgram() }
-        case .cancel:
-            Task { await machine.cancelProgram() }
-        }
-    }
 }
 
-private enum ProgramConfirmation: Equatable {
-    case start(ProgramStatus)
-    case cancel
+private struct ProgramStartReview: Identifiable {
+    let program: ProgramStatus
+    let workPosition: String?
+    let previewKey: String
 
-    var title: String {
-        switch self {
-        case .start: return "Запустить программу?"
-        case .cancel: return "Отменить выполнение?"
-        }
-    }
-
-    var message: String {
-        switch self {
-        case .start(let program):
-            return "«\(program.name)», \(program.lines) строк. Выполнение начнётся от текущих рабочих координат."
-        case .cancel:
-            return "Станок плавно остановится, буфер движения будет очищен. Координаты сохранятся."
-        }
-    }
-
-    var actionTitle: String {
-        switch self {
-        case .start: return "Запустить"
-        case .cancel: return "Отменить программу"
-        }
-    }
-
-    var role: ButtonRole? {
-        switch self {
-        case .start: return nil
-        case .cancel: return .destructive
-        }
-    }
+    var id: String { previewKey }
 }
 
 private struct ToolpathView: View {
@@ -270,16 +271,10 @@ private struct ToolpathView: View {
         if line > 0 {
             Text("≈ Строка \(line): \(status.program.currentText ?? "")")
                 .font(.caption.monospaced()).textSelection(.enabled)
-        } else {
-            Text(status.program.name.isEmpty ? "Загрузите G-code для просмотра" :
-                 status.program.state == "completed" ? "Программа выполнена" :
-                 live ? "Текущая строка не определена" : "Предпросмотр траектории")
+        } else if status.program.state == "running" {
+            Text("Текущая строка не определена")
                 .font(.caption).foregroundStyle(.secondary)
         }
-        Text("Зелёный — пройдено · оранжевый — текущая строка · красная точка — инструмент · пунктир — G0")
-            .font(.caption2).foregroundStyle(.secondary)
-        Text("≈ Строка определяется по координатам; на пересечениях возможна погрешность. Начальные режимы: G21 G90 G17. Высота — Z, размеры — мм.")
-            .font(.caption2).foregroundStyle(.secondary)
         if let warning = preview?.warning, !warning.isEmpty {
             Text(warning).font(.caption).foregroundStyle(.orange)
         }

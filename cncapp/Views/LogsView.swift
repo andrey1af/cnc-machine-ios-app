@@ -1,9 +1,51 @@
 import SwiftUI
 
-struct LogsView: View {
-    @EnvironmentObject private var logStore: LogStore
+struct LogsCard: View {
+    @ObservedObject var logStore: LogStore
     @State private var showDebug = false
     @State private var follow = true
+
+    var body: some View {
+        NavigationLink {
+            LogsView(showDebug: $showDebug, follow: $follow)
+                .environmentObject(logStore)
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "list.bullet.rectangle")
+                    .font(.title2)
+                    .foregroundStyle(Color.accentColor)
+                    .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Журнал")
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                    Text(logStore.snapshot.standard.last?.msg ?? "События станка")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.background, in: RoundedRectangle(cornerRadius: 18))
+            .contentShape(RoundedRectangle(cornerRadius: 18))
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Открывает список событий станка")
+    }
+}
+
+struct LogsView: View {
+    @EnvironmentObject private var logStore: LogStore
+    @Binding var showDebug: Bool
+    @Binding var follow: Bool
     @State private var scrollTask: Task<Void, Never>?
 
     private var visibleLogs: [LogEntry] {
@@ -11,53 +53,54 @@ struct LogsView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if visibleLogs.isEmpty {
-                    ContentUnavailableView(
-                        "Журнал пуст",
-                        systemImage: "list.bullet.rectangle",
-                        description: Text("События станка появятся после подключения")
-                    )
-                } else {
-                    ScrollViewReader { proxy in
-                        List(visibleLogs) { entry in
-                            LogRow(entry: entry)
-                                .id(entry.id)
-                                .listRowSeparator(.hidden)
-                                .listRowBackground(Color.clear)
+        Group {
+            if visibleLogs.isEmpty {
+                ContentUnavailableView(
+                    "Журнал пуст",
+                    systemImage: "list.bullet.rectangle",
+                    description: Text("События станка появятся после подключения")
+                )
+            } else {
+                ScrollViewReader { proxy in
+                    List(visibleLogs) { entry in
+                        LogRow(entry: entry)
+                            .id(entry.id)
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
+                    }
+                    .listStyle(.plain)
+                    .onChange(of: visibleLogs.last?.id, initial: true) { _, _ in
+                        guard follow, scrollTask == nil else { return }
+                        scrollTask = Task { @MainActor in
+                            do { try await Task.sleep(for: .milliseconds(150)) }
+                            catch { return }
+                            scrollTask = nil
+                            guard follow, let id = visibleLogs.last?.id else { return }
+                            proxy.scrollTo(id, anchor: .bottom)
                         }
-                        .listStyle(.plain)
-                        .onChange(of: visibleLogs.last?.id) { _, _ in
-                            guard follow, scrollTask == nil else { return }
-                            scrollTask = Task { @MainActor in
-                                do { try await Task.sleep(for: .milliseconds(150)) }
-                                catch { scrollTask = nil; return }
-                                scrollTask = nil
-                                guard follow, let id = visibleLogs.last?.id else { return }
-                                proxy.scrollTo(id, anchor: .bottom)
-                            }
-                        }
-                        .onDisappear { scrollTask?.cancel(); scrollTask = nil }
+                    }
+                    .onDisappear {
+                        scrollTask?.cancel()
+                        scrollTask = nil
                     }
                 }
             }
-            .navigationTitle("Журнал")
-            .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    ConnectionMenuButton()
-                    Menu {
-                        Toggle("Показывать DEBUG", isOn: $showDebug)
-                        Toggle("Автопрокрутка", isOn: $follow)
-                    } label: {
-                        Image(systemName: "line.3.horizontal.decrease.circle")
-                    }
-                    Button(role: .destructive) { logStore.clear() } label: {
-                        Image(systemName: "trash")
-                    }
-                    .disabled(logStore.snapshot.all.isEmpty)
+        }
+        .navigationTitle("Журнал")
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Menu {
+                    Toggle("Показывать DEBUG", isOn: $showDebug)
+                    Toggle("Автопрокрутка", isOn: $follow)
+                } label: {
+                    Image(systemName: "line.3.horizontal.decrease.circle")
                 }
+                Button(role: .destructive) { logStore.clear() } label: {
+                    Image(systemName: "trash")
+                }
+                .disabled(logStore.snapshot.all.isEmpty)
             }
+            ConnectionToolbarItem()
         }
     }
 }

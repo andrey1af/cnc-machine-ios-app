@@ -7,28 +7,28 @@ struct ControlView: View {
     @State private var feedXY = 100.0
     @State private var feedZ = 300.0
     @State private var lockedControls: Set<ControlField> = []
+    @State private var pendingControls: Set<ControlField> = []
     @State private var coordinateChangesLocked = false
 
     private let grid = [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())]
+    private let speedPresets: [Double] = [10, 25, 50, 100, 200]
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
-                    statusPanel
                     jogPanel
                     settingsPanel
                     machinePanel
-                    emergencyButton
+                    LogsCard(logStore: machine.logStore)
                 }
                 .padding()
             }
+            .safeAreaInset(edge: .top, spacing: 0) { MachineStatusPanel() }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("CNC Пульт")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    ConnectionMenuButton()
-                }
+                ConnectionToolbarItem()
             }
             .confirmationDialog(
                 "Обнулить рабочие координаты X, Y и Z в текущей точке?",
@@ -40,36 +40,18 @@ struct ControlView: View {
             }
             .onAppear(perform: syncControls)
             .onChange(of: machine.status) { _, _ in syncControls() }
+            .onChange(of: canEditSettings) { _, available in
+                if !available {
+                    lockedControls.removeAll()
+                    syncControls()
+                }
+            }
             .onDisappear { machine.endJog() }
         }
     }
 
-    private var statusPanel: some View {
-        Panel("Координаты") {
-            LazyVGrid(columns: grid, spacing: 10) {
-                ForEach(Axis.allCases, id: \.self) { axis in
-                    AxisPosition(
-                        axis: axis,
-                        value: machine.status.position(for: axis),
-                        isLimited: machine.status.pins.contains(axis.rawValue)
-                    )
-                }
-            }
-            HStack {
-                Label(machine.status.posLabel.isEmpty ? "Нет данных" : machine.status.posLabel,
-                      systemImage: "scope")
-                Spacer()
-                Text(machine.status.state)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(stateColor)
-            }
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-        }
-    }
-
     private var jogPanel: some View {
-        Panel("Перемещение") {
+        Panel("Перемещение", help: "Короткое касание перемещает ось на один шаг. Удерживайте кнопку для непрерывного движения. Блокировка отключает ручное перемещение.") {
             Button {
                 coordinateChangesLocked.toggle()
                 if coordinateChangesLocked { machine.endJog() }
@@ -110,12 +92,6 @@ struct ControlView: View {
                 }
                 .frame(width: 66, height: 208)
             }
-
-            Text(coordinateChangesLocked
-                 ? "Ручное перемещение заблокировано."
-                 : "Касание — один шаг. Удерживайте кнопку для непрерывного движения.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
     }
 
@@ -126,6 +102,8 @@ struct ControlView: View {
                 value: $stepPosition,
                 range: 0...1_000,
                 valueText: "\(formattedStep) мм",
+                presets: [0.1, 1, 5, 10, 50],
+                unit: "мм",
                 fractionDigits: 3,
                 inputValue: stepFrom(position:),
                 sliderValue: positionFrom(step:),
@@ -136,12 +114,15 @@ struct ControlView: View {
                     commit(.step) { await machine.updateStep(stepFrom(position: position)) }
                 }
             )
+            .disabled(pendingControls.contains(.step))
 
             ValueSlider(
                 title: "Скорость X/Y",
                 value: $feedXY,
                 range: 1...300,
                 valueText: "\(Int(feedXY)) мм/мин",
+                presets: speedPresets,
+                unit: "мм/мин",
                 onEditingChanged: { editing in
                     setEditing(.feedXY, editing: editing)
                 },
@@ -149,12 +130,15 @@ struct ControlView: View {
                     commit(.feedXY) { await machine.updateFeedXY(value) }
                 }
             )
+            .disabled(pendingControls.contains(.feedXY))
 
             ValueSlider(
                 title: "Скорость Z",
                 value: $feedZ,
                 range: 1...300,
                 valueText: "\(Int(feedZ)) мм/мин",
+                presets: speedPresets,
+                unit: "мм/мин",
                 onEditingChanged: { editing in
                     setEditing(.feedZ, editing: editing)
                 },
@@ -162,8 +146,9 @@ struct ControlView: View {
                     commit(.feedZ) { await machine.updateFeedZ(value) }
                 }
             )
+            .disabled(pendingControls.contains(.feedZ))
         }
-        .disabled(machine.connection == .serverOffline)
+        .disabled(!canEditSettings)
     }
 
     private var machinePanel: some View {
@@ -193,20 +178,6 @@ struct ControlView: View {
         }
     }
 
-    private var emergencyButton: some View {
-        Button(role: .destructive) {
-            Task { await machine.emergencyStop() }
-        } label: {
-            Label("АВАРИЙНЫЙ СТОП", systemImage: "stop.circle.fill")
-                .font(.headline)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-        }
-        .buttonStyle(.borderedProminent)
-        .tint(.red)
-        .disabled(!machine.status.connected)
-    }
-
     private func jogButton(_ title: String, icon: String, axis: Axis, direction: Int) -> some View {
         JogButton(title: title, systemImage: icon) {
             machine.beginJog(axis: axis, direction: direction)
@@ -226,10 +197,8 @@ struct ControlView: View {
         machine.status.connected && !machine.status.program.running
     }
 
-    private var stateColor: Color {
-        if machine.status.isAlarm { return .red }
-        if machine.status.isIdle { return .green }
-        return .orange
+    private var canEditSettings: Bool {
+        machine.connection == .connected || machine.connection == .controllerOffline
     }
 
     private var formattedStep: String {
@@ -248,31 +217,35 @@ struct ControlView: View {
     }
 
     private func syncControls() {
-        if !lockedControls.contains(.step) {
+        if !lockedControls.contains(.step), !pendingControls.contains(.step) {
             stepPosition = positionFrom(step: machine.status.step)
         }
-        if !lockedControls.contains(.feedXY) {
+        if !lockedControls.contains(.feedXY), !pendingControls.contains(.feedXY) {
             feedXY = min(max(machine.status.feedXY, 1), 300)
         }
-        if !lockedControls.contains(.feedZ) {
+        if !lockedControls.contains(.feedZ), !pendingControls.contains(.feedZ) {
             feedZ = min(max(machine.status.feedZ, 1), 300)
         }
     }
 
     private func setEditing(_ field: ControlField, editing: Bool) {
-        if editing {
+        if editing && canEditSettings {
             lockedControls.insert(field)
         } else {
             lockedControls.remove(field)
         }
     }
 
-    private func commit(_ field: ControlField, operation: @escaping @MainActor () async -> Void) {
-        lockedControls.insert(field)
-        Task {
-            await operation()
-            lockedControls.remove(field)
+    private func commit(_ field: ControlField, operation: @escaping @MainActor () async -> Bool) {
+        guard canEditSettings else {
             syncControls()
+            return
+        }
+        guard pendingControls.insert(field).inserted else { return }
+        Task {
+            let applied = if canEditSettings { await operation() } else { false }
+            pendingControls.remove(field)
+            if !applied { syncControls() }
         }
     }
 }

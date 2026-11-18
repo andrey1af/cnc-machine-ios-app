@@ -45,6 +45,16 @@ struct MachineStatus: Codable, Equatable, Sendable {
         return pos.indices.contains(index) ? pos[index] : 0
     }
 
+    var hasPosition: Bool {
+        connected && (posLabel == "WPos" || posLabel == "MPos") &&
+        pos.count == Axis.allCases.count && pos.allSatisfy(\.isFinite)
+    }
+
+    func coordinateText(for axis: Axis) -> String {
+        guard hasPosition else { return "—" }
+        return String(format: "%+.3f", position(for: axis))
+    }
+
     var isAlarm: Bool { state.localizedCaseInsensitiveContains("alarm") }
     var isIdle: Bool { state == "Idle" }
     var isOnHold: Bool { state.hasPrefix("Hold") }

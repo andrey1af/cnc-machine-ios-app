@@ -3,19 +3,27 @@ import SwiftUI
 
 struct Panel<Content: View>: View {
     let title: String
+    let help: String?
     @ViewBuilder let content: Content
 
-    init(_ title: String, @ViewBuilder content: () -> Content) {
+    init(_ title: String, help: String? = nil, @ViewBuilder content: () -> Content) {
         self.title = title
+        self.help = help
         self.content = content()
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text(title.uppercased())
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .tracking(0.7)
+            HStack {
+                Text(title.uppercased())
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .tracking(0.7)
+                if let help {
+                    Spacer()
+                    PanelHelpButton(title: title, message: help)
+                }
+            }
             content
         }
         .padding(16)
@@ -24,6 +32,29 @@ struct Panel<Content: View>: View {
         .overlay {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(Color(uiColor: .separator).opacity(0.45), lineWidth: 0.5)
+        }
+    }
+}
+
+private struct PanelHelpButton: View {
+    let title: String
+    let message: String
+    @State private var isShowing = false
+
+    var body: some View {
+        Button { isShowing = true } label: {
+            Image(systemName: "questionmark.circle")
+                .font(.body)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.tint)
+        .accessibilityLabel("Справка: \(title)")
+        .alert(title, isPresented: $isShowing) {
+            Button("Закрыть", role: .cancel) {}
+        } message: {
+            Text(message)
         }
     }
 }
@@ -49,24 +80,58 @@ struct ConnectionBadge: View {
     }
 }
 
-struct ConnectionMenuButton: View {
+struct ConnectionToolbarItem: ToolbarContent {
+    var body: some ToolbarContent {
+        let item = ToolbarItem(placement: .topBarTrailing) {
+            ConnectionMenuButton()
+        }
+        #if compiler(>=6.2)
+        if #available(iOS 26, *) {
+            item.sharedBackgroundVisibility(.hidden)
+        } else {
+            item
+        }
+        #else
+        item
+        #endif
+    }
+}
+
+private struct ConnectionMenuButton: View {
     @EnvironmentObject private var machine: MachineViewModel
     @State private var showConnection = false
 
     var body: some View {
         Button { showConnection = true } label: {
-            Image(systemName: machine.connection.symbol)
-                .font(.title3)
-                .foregroundStyle(color)
-                .frame(minWidth: 44, minHeight: 44)
+            icon.contentShape(Circle())
         }
+        .buttonStyle(.plain)
         .accessibilityLabel("Подключение: \(machine.connection.title)")
         .accessibilityHint("Открыть настройки подключения; удерживайте для просмотра статуса")
+        .contentShape(.contextMenuPreview, Circle())
         .contextMenu {
             Label(machine.connection.title, systemImage: machine.connection.symbol)
                 .disabled(true)
         }
         .sheet(isPresented: $showConnection) { ConnectionView() }
+    }
+
+    @ViewBuilder
+    private var icon: some View {
+        let symbol = Image(systemName: machine.connection.symbol)
+            .font(.title3)
+            .foregroundStyle(color)
+            .frame(width: 44, height: 44)
+
+        #if compiler(>=6.2)
+        if #available(iOS 26, *) {
+            symbol.glassEffect(.regular.interactive(), in: Circle())
+        } else {
+            symbol.background(.regularMaterial, in: Circle())
+        }
+        #else
+        symbol.background(.regularMaterial, in: Circle())
+        #endif
     }
 
     private var color: Color {
@@ -125,9 +190,90 @@ struct JogButton: View {
     }
 }
 
-struct AxisPosition: View {
+struct MachineStatusPanel: View {
+    @EnvironmentObject private var machine: MachineViewModel
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                ForEach(Axis.allCases, id: \.self) { axis in
+                    AxisPosition(
+                        axis: axis,
+                        value: machine.status.coordinateText(for: axis),
+                        isLimited: machine.status.connected && machine.status.pins.contains(axis.rawValue)
+                    )
+                }
+            }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    details
+                    Spacer(minLength: 0)
+                    emergencyButton
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    details
+                    emergencyButton
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color(uiColor: .systemGroupedBackground))
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    private var details: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(statusText)
+                .fontWeight(.semibold)
+                .foregroundStyle(statusColor)
+            if let receivedAt = machine.positionReceivedAt {
+                let time = receivedAt.formatted(date: .omitted, time: .standard)
+                Text(machine.status.hasPosition ? "Получено в \(time)" : "Последние данные в \(time)")
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Координаты недоступны")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.caption)
+        .monospacedDigit()
+    }
+
+    private var statusText: String {
+        guard machine.connection == .connected else { return machine.connection.title }
+        guard machine.status.hasPosition else { return machine.status.state }
+        return "\(machine.status.posLabel) · мм · \(machine.status.state)"
+    }
+
+    private var statusColor: Color {
+        switch machine.connection {
+        case .serverOffline, .controllerOffline: return .red
+        case .connecting: return .orange
+        case .connected:
+            if machine.status.isAlarm { return .red }
+            return machine.status.isIdle ? .green : .orange
+        }
+    }
+
+    private var emergencyButton: some View {
+        Button(role: .destructive) {
+            Task { await machine.emergencyStop() }
+        } label: {
+            Label("Аварийный стоп", systemImage: "stop.circle.fill")
+                .font(.caption.weight(.semibold))
+                .frame(minHeight: 34)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(.red)
+        .disabled(!machine.status.connected)
+    }
+}
+
+private struct AxisPosition: View {
     let axis: Axis
-    let value: Double
+    let value: String
     let isLimited: Bool
 
     var body: some View {
@@ -135,14 +281,16 @@ struct AxisPosition: View {
             Text(axis.rawValue)
                 .font(.caption.bold())
                 .foregroundStyle(isLimited ? .red : .secondary)
-            Text(String(format: "%+.3f", value))
-                .font(.system(.title3, design: .monospaced, weight: .semibold))
-                .minimumScaleFactor(0.7)
+            Text(value)
+                .font(.system(.callout, design: .monospaced, weight: .semibold))
+                .minimumScaleFactor(0.6)
                 .lineLimit(1)
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
         .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -151,6 +299,8 @@ struct ValueSlider: View {
     @Binding var value: Double
     let range: ClosedRange<Double>
     let valueText: String
+    let presets: [Double]
+    let unit: String
     let fractionDigits: Int
     let inputValue: (Double) -> Double
     let sliderValue: (Double) -> Double
@@ -158,6 +308,7 @@ struct ValueSlider: View {
     let onCommit: (Double) -> Void
 
     @State private var draft = ""
+    @State private var showPresets = false
     @FocusState private var fieldFocused: Bool
 
     init(
@@ -165,6 +316,8 @@ struct ValueSlider: View {
         value: Binding<Double>,
         range: ClosedRange<Double>,
         valueText: String,
+        presets: [Double],
+        unit: String,
         fractionDigits: Int = 0,
         inputValue: @escaping (Double) -> Double = { $0 },
         sliderValue: @escaping (Double) -> Double = { $0 },
@@ -175,6 +328,8 @@ struct ValueSlider: View {
         _value = value
         self.range = range
         self.valueText = valueText
+        self.presets = presets
+        self.unit = unit
         self.fractionDigits = fractionDigits
         self.inputValue = inputValue
         self.sliderValue = sliderValue
@@ -187,9 +342,22 @@ struct ValueSlider: View {
             HStack {
                 Text(title)
                 Spacer()
-                Text(valueText)
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                Button {
+                    showPresets = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Text(valueText).font(.callout.monospacedDigit())
+                        Image(systemName: "chevron.down").font(.caption2)
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+                .accessibilityLabel("\(title), \(valueText)")
+                .accessibilityHint("Выбрать предустановленное значение")
+                .contextMenu { presetOptions }
+                .confirmationDialog(title, isPresented: $showPresets, titleVisibility: .visible) {
+                    presetOptions
+                }
             }
             HStack(spacing: 10) {
                 Slider(value: $value, in: range) { editing in
@@ -230,18 +398,30 @@ struct ValueSlider: View {
         }
     }
 
+    private var presetOptions: some View {
+        ForEach(presets, id: \.self) { preset in
+            Button("\(preset.formatted()) \(unit)") {
+                let position = clamped(sliderValue(preset))
+                value = position
+                syncDraft()
+                fieldFocused = false
+                onCommit(position)
+            }
+        }
+    }
+
     private func applyDraft() {
         let normalized = draft.replacingOccurrences(of: ",", with: ".")
+        onEditingChanged(false)
+        guard draft != formattedValue else { return }
         guard let parsed = Double(normalized), parsed.isFinite else {
             syncDraft()
-            onEditingChanged(false)
             return
         }
 
         let newValue = clamped(sliderValue(parsed))
         value = newValue
         syncDraft()
-        onEditingChanged(false)
         onCommit(newValue)
     }
 
@@ -250,16 +430,20 @@ struct ValueSlider: View {
     }
 
     private func syncDraft() {
+        draft = formattedValue
+    }
+
+    private var formattedValue: String {
         let displayedValue = inputValue(value)
         if fractionDigits == 0 {
-            draft = String(Int(displayedValue.rounded()))
+            return String(Int(displayedValue.rounded()))
         } else {
             var formatted = String(format: "%.*f", fractionDigits, displayedValue)
             if formatted.contains(".") {
                 while formatted.last == "0" { formatted.removeLast() }
                 if formatted.last == "." { formatted.removeLast() }
             }
-            draft = formatted
+            return formatted
         }
     }
 }
