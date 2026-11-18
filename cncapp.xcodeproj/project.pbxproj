@@ -19,6 +19,7 @@
 		A1000000000000000000000A /* LogsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* LogsView.swift */; };
 		A1000000000000000000000B /* ConnectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* ConnectionView.swift */; };
 		A1000000000000000000000C /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000C /* Assets.xcassets */; };
+		A1000000000000000000000D /* MachinePolicies.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000F /* MachinePolicies.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -36,6 +37,7 @@
 		A2000000000000000000000C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A2000000000000000000000D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A2000000000000000000000E /* cncapp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = cncapp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A2000000000000000000000F /* MachinePolicies.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachinePolicies.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -74,6 +76,7 @@
 			isa = PBXGroup;
 			children = (
 				A20000000000000000000002 /* CNCModels.swift */,
+				A2000000000000000000000F /* MachinePolicies.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -205,6 +208,7 @@
 			files = (
 				A10000000000000000000001 /* CNCApp.swift in Sources */,
 				A10000000000000000000002 /* CNCModels.swift in Sources */,
+				A1000000000000000000000D /* MachinePolicies.swift in Sources */,
 				A10000000000000000000003 /* CNCAPIClient.swift in Sources */,
 				A10000000000000000000004 /* SSEClient.swift in Sources */,
 				A10000000000000000000005 /* MachineViewModel.swift in Sources */,

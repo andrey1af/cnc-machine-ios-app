@@ -215,9 +215,7 @@ struct ProgramView: View {
     }
 
     private var canStart: Bool {
-        machine.status.connected &&
-        !machine.status.program.name.isEmpty &&
-        !machine.status.program.running
+        machine.status.canStartProgram
     }
 
     private var startPositionText: String? {

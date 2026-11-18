@@ -27,9 +27,6 @@ final class LogStore: ObservableObject {
 
 @MainActor
 final class MachineViewModel: ObservableObject {
-    private static let reconnectAttempts = 3
-    private static let reconnectDelay: Duration = .seconds(5)
-
     @Published private(set) var status = MachineStatus.disconnected
     @Published private(set) var connection: ServerConnection = .connecting
     @Published private(set) var positionReceivedAt: Date?
@@ -73,7 +70,7 @@ final class MachineViewModel: ObservableObject {
     private var client: CNCAPIClient
     private var eventClient: SSEClient?
     private var reconnectTask: Task<Void, Never>?
-    private var retriesRemaining = 0
+    private var reconnectPolicy = ReconnectPolicy()
     private var jogTask: Task<Void, Never>?
     private var jogRepeated = false
     private var lastLogID: Int64 = 0
@@ -102,7 +99,7 @@ final class MachineViewModel: ObservableObject {
     func disconnect() {
         reconnectTask?.cancel()
         reconnectTask = nil
-        retriesRemaining = 0
+        reconnectPolicy.reset()
         closeEventStream()
     }
 
@@ -203,8 +200,7 @@ final class MachineViewModel: ObservableObject {
     }
 
     var canUploadProgram: Bool {
-        (connection == .connected || connection == .controllerOffline) &&
-        !isUploading && !status.program.running
+        status.canUploadProgram(connection: connection, isUploading: isUploading)
     }
 
     func uploadProgram(from url: URL) async {
@@ -305,7 +301,7 @@ final class MachineViewModel: ObservableObject {
             logStore.append(entry)
         case "status":
             guard let newStatus = try? JSONDecoder().decode(MachineStatus.self, from: payload) else { return }
-            retriesRemaining = Self.reconnectAttempts
+            reconnectPolicy.recordServerStatus()
             if newStatus.hasPosition { positionReceivedAt = Date() }
             status = newStatus
             connection = newStatus.connected ? .connected : .controllerOffline
@@ -317,17 +313,16 @@ final class MachineViewModel: ObservableObject {
     private func handleDisconnect() {
         closeEventStream()
         endJog()
-        guard retriesRemaining > 0 else { return }
+        guard reconnectPolicy.consumeRetry() else { return }
 
         reconnectTask = Task { [weak self] in
             do {
-                try await Task.sleep(for: Self.reconnectDelay)
+                try await Task.sleep(for: ReconnectPolicy.retryDelay)
             } catch {
                 return
             }
             guard !Task.isCancelled, let self else { return }
             self.reconnectTask = nil
-            self.retriesRemaining -= 1
             self.startEventStream()
         }
     }

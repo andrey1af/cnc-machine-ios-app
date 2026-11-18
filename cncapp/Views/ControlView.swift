@@ -198,7 +198,7 @@ struct ControlView: View {
     }
 
     private var canEditSettings: Bool {
-        machine.connection == .connected || machine.connection == .controllerOffline
+        machine.connection.canReachServer
     }
 
     private var formattedStep: String {
