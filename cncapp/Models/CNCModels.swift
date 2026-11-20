@@ -61,8 +61,10 @@ struct MachineStatus: Codable, Equatable, Sendable {
 }
 
 struct ProgramStatus: Codable, Equatable, Sendable {
+    var phase: String? = nil
     var revision: UInt64? = nil
     var currentLine: Int? = nil
+    var resumeLine: Int? = nil
     var currentText: String? = nil
     var completed: Int? = nil
     var elapsedSeconds: Int? = nil
@@ -106,13 +108,25 @@ struct ProgramStatus: Codable, Equatable, Sendable {
         guard !name.isEmpty else { return "Программа не загружена" }
         switch state {
         case "queued": return "Ожидает запуска"
-        case "running": return "Отправлено \(sent) из \(lines) строк"
+        case "running":
+            if phase == "before" { return "Выполняется предпрограмма" }
+            if phase == "after" { return "Выполняется послепрограмма" }
+            return "Отправлено \(sent) из \(lines) строк"
         case "completed": return "Выполнена"
         case "canceled": return "Отменена на строке \(lastLine)"
+        case "interrupted":
+            return "Связь прервана на строке \(lastLine). Повтор прохода со строки \(resumeLine ?? 0)."
+                + (error.map { " " + $0 } ?? "")
         case "failed": return "Ошибка в строке \(lastLine)"
         default: return "\(lines) строк"
         }
     }
+}
+
+struct ProgramBlocks: Codable, Equatable, Sendable {
+    var before: String
+    var after: String
+    let revision: String
 }
 
 struct LogEntry: Codable, Identifiable, Equatable, Sendable {
@@ -145,8 +159,76 @@ struct ErrorResponse: Codable, Sendable {
     let details: String?
 }
 
+struct ControllerSettingGroup: Decodable, Sendable {
+    let title: String
+    let settings: [ControllerSetting]
+}
+
+struct ControllerSetting: Decodable, Identifiable, Sendable {
+    enum Kind: String, Decodable, Sendable { case toggle, integer, decimal }
+
+    let id: String
+    let label: String
+    let unit: String?
+    let kind: Kind
+    let min: Double
+    let max: Double
+    let value: Double?
+
+    var caption: String { unit.map { "$\(id) · \($0)" } ?? "$\(id)" }
+
+    static func number(_ text: String) -> Double? {
+        guard let number = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ",", with: ".")),
+              number.isFinite else { return nil }
+        return number
+    }
+
+    func parse(_ text: String) -> Double? {
+        guard let number = Self.number(text), number >= min, number <= max,
+              kind == .decimal || number.rounded(.towardZero) == number else { return nil }
+        return number
+    }
+
+    static func text(_ value: Double) -> String {
+        let text = String(value)
+        return text.hasSuffix(".0") ? String(text.dropLast(2)) : text
+    }
+}
+
+struct ControllerSettingChange: Encodable, Sendable {
+    let from: Double
+    let to: Double
+}
+
+struct ControllerSettingsDraft {
+    private(set) var groups: [ControllerSettingGroup] = []
+    var values: [String: String] = [:]
+
+    var edited: [ControllerSetting] {
+        groups.flatMap(\.settings).filter { setting in
+            guard let original = setting.value, let candidate = values[setting.id] else { return false }
+            return ControllerSetting.number(candidate) != original
+        }
+    }
+
+    mutating func replace(with newGroups: [ControllerSettingGroup], keepingEdits: Bool = false) {
+        let originals = keepingEdits ? Dictionary(edited.compactMap { setting in
+            setting.value.map { (setting.id, $0) }
+        }, uniquingKeysWith: { first, _ in first }) : [:]
+        var nextValues: [String: String] = [:]
+        for setting in newGroups.flatMap(\.settings) {
+            guard let value = setting.value else { continue }
+            nextValues[setting.id] = originals[setting.id] == value ? values[setting.id] : ControllerSetting.text(value)
+        }
+        groups = newGroups
+        values = nextValues
+    }
+}
+
 enum ServerConnection: Equatable {
     case connecting
+    case authenticationRequired
     case serverOffline
     case controllerOffline
     case connected
@@ -154,6 +236,7 @@ enum ServerConnection: Equatable {
     var title: String {
         switch self {
         case .connecting: return "Подключение…"
+        case .authenticationRequired: return "Требуется вход"
         case .serverOffline: return "Сервер недоступен"
         case .controllerOffline: return "Контроллер отключён"
         case .connected: return "Подключено"
@@ -163,6 +246,7 @@ enum ServerConnection: Equatable {
     var symbol: String {
         switch self {
         case .connecting: return "arrow.triangle.2.circlepath"
+        case .authenticationRequired: return "lock.fill"
         case .serverOffline: return "wifi.slash"
         case .controllerOffline: return "cable.connector.slash"
         case .connected: return "checkmark.circle.fill"

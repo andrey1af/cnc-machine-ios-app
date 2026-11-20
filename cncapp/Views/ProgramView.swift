@@ -6,6 +6,21 @@ struct ProgramView: View {
     @State private var isImporterPresented = false
     @State private var startReview: ProgramStartReview?
     @State private var showCancelConfirmation = false
+    @State private var showResumeConfirmation = false
+    @State private var savedBlocks: ProgramBlocks?
+    @State private var blocksSource: String?
+    @State private var loadedBlocksKey: String?
+    @State private var before = ""
+    @State private var after = ""
+    @State private var blocksBusy = false
+    @State private var blocksError: String?
+    @State private var blocksReload = 0
+    @State private var confirmReload = false
+    @State private var starting = false
+    @State private var manualLine = ""
+    @State private var manualReview: ManualGCodeReview?
+    @State private var manualBusy = false
+    @State private var manualAccepted = false
 
     var body: some View {
         NavigationStack {
@@ -13,6 +28,8 @@ struct ProgramView: View {
                 VStack(spacing: 14) {
                     programCard
                     controlsCard
+                    programBlocksCard
+                    manualCard
                     toolpathCard
                 }
                 .padding()
@@ -21,6 +38,13 @@ struct ProgramView: View {
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("G-code")
             .task(id: machine.previewKey) { await machine.loadPreview() }
+            .task(id: blocksLoadKey) { [key = blocksLoadKey] in
+                if key == nil {
+                    blocksBusy = false
+                } else if key != loadedBlocksKey {
+                    await fetchBlocks()
+                }
+            }
             .toolbar {
                 ConnectionToolbarItem()
             }
@@ -35,6 +59,10 @@ struct ProgramView: View {
             .sheet(item: $startReview) { review in
                 startConfirmation(for: review)
             }
+            .alert("Считать пред- и послепрограмму с Repka?", isPresented: $confirmReload) {
+                Button("Сбросить правки", role: .destructive) { blocksReload += 1 }
+                Button("Отмена", role: .cancel) {}
+            }
             .confirmationDialog(
                 "Отменить выполнение?",
                 isPresented: $showCancelConfirmation,
@@ -47,7 +75,148 @@ struct ProgramView: View {
             } message: {
                 Text("Станок плавно остановится, буфер движения будет очищен. Координаты сохранятся.")
             }
+            .alert("Повторить прерванный проход?", isPresented: $showResumeConfirmation) {
+                Button("Продолжить") {
+                    guard machine.status.program.state == "interrupted", machine.status.isIdle else { return }
+                    Task { await machine.resumeProgram() }
+                }
+                Button("Отмена", role: .cancel) {}
+            } message: {
+                Text("Строка \(machine.status.program.resumeLine ?? 0). Проверьте исходный ноль G54, крепление детали, свободный ход над заготовкой и готовность шпинделя.")
+            }
         }
+    }
+
+    private var blocksKey: String { "\(machine.activeServerURL)-\(machine.serverEpoch)" }
+
+    private var blocksLoadKey: String? {
+        machine.connection.canReachServer ? "\(blocksKey)-\(blocksReload)" : nil
+    }
+
+    private var blocksDirty: Bool {
+        guard let savedBlocks, blocksSource == blocksKey else { return false }
+        return savedBlocks.before != before || savedBlocks.after != after
+    }
+
+    private var canEditBlocks: Bool {
+        blocksSource == blocksKey && savedBlocks != nil && !blocksBusy && !machine.status.program.running && machine.connection.canReachServer
+    }
+
+    private var programBlocksCard: some View {
+        Panel("До и после программы") {
+            if blocksBusy {
+                ProgressView("Обновляем данные с Repka…")
+            }
+            if let blocksError {
+                Text(blocksError).font(.footnote).foregroundStyle(.red)
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                codeEditor("Предпрограмма", text: $before)
+                codeEditor("Послепрограмма", text: $after)
+            }
+            .disabled(!canEditBlocks)
+
+            Text(blocksDirty ? "Сохраните правки перед запуском." : "Пустые поля пропускаются при запуске.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Button("Сохранить") {
+                    guard let savedBlocks else { return }
+                    let update = ProgramBlocks(before: before, after: after, revision: savedBlocks.revision)
+                    Task { await fetchBlocks(saving: update) }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canEditBlocks || !blocksDirty)
+
+                Button("Считать с Repka") {
+                    if blocksDirty { confirmReload = true } else { blocksReload += 1 }
+                }
+                .buttonStyle(.bordered)
+                .disabled(blocksBusy || !machine.connection.canReachServer)
+            }
+        }
+    }
+
+    private func codeEditor(_ title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.subheadline.weight(.medium))
+            TextEditor(text: text)
+                .font(.body.monospaced())
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .frame(minHeight: 72)
+                .padding(4)
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.secondary.opacity(0.3)))
+                .accessibilityLabel(title)
+        }
+    }
+
+    private func fetchBlocks(saving update: ProgramBlocks? = nil) async {
+        let source = blocksKey
+        let loadKey = blocksLoadKey
+        if update != nil && blocksBusy { return }
+        blocksBusy = true
+        blocksError = nil
+        defer { if loadKey == blocksLoadKey { blocksBusy = false } }
+        do {
+            let result = try await machine.programBlocks(saving: update)
+            guard !Task.isCancelled, loadKey == blocksLoadKey else { return }
+            savedBlocks = result
+            blocksSource = source
+            loadedBlocksKey = loadKey
+            before = result.before
+            after = result.after
+        } catch {
+            guard !Task.isCancelled, loadKey == blocksLoadKey else { return }
+            blocksError = error.localizedDescription
+        }
+    }
+
+    private var manualCard: some View {
+        Panel("Ручная команда G-code") {
+            TextField("Строка G-code", text: $manualLine)
+                .font(.body.monospaced())
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .textFieldStyle(.roundedBorder)
+            Button("Выполнить") {
+                manualReview = ManualGCodeReview(
+                    line: manualLine.trimmingCharacters(in: .whitespacesAndNewlines), source: blocksKey
+                )
+            }
+                .buttonStyle(.bordered)
+                .disabled(!canExecuteLine || manualLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            if manualAccepted {
+                Text("Команда принята. Результат появится в журнале.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+        .alert("Выполнить строку G-code?", isPresented: Binding(
+            get: { manualReview != nil }, set: { if !$0 { manualReview = nil } }
+        ), presenting: manualReview) { pending in
+            Button("Подтвердить и выполнить") {
+                guard canExecuteLine, pending.source == blocksKey else { return }
+                let line = pending.line
+                manualReview = nil
+                manualBusy = true
+                manualAccepted = false
+                Task {
+                    defer { manualBusy = false }
+                    if await machine.executeGCode(line) {
+                        if manualLine.trimmingCharacters(in: .whitespacesAndNewlines) == line { manualLine = "" }
+                        manualAccepted = true
+                    }
+                }
+            }
+            Button("Отмена", role: .cancel) { manualReview = nil }
+        } message: { pending in
+            Text(pending.line)
+        }
+    }
+
+    private var canExecuteLine: Bool {
+        machine.connection == .connected && machine.status.isIdle && !machine.status.program.running && !manualBusy
     }
 
     private var programCard: some View {
@@ -136,10 +305,12 @@ struct ProgramView: View {
     private var controlsCard: some View {
         Panel("Управление выполнением") {
             Button {
+                guard let savedBlocks else { return }
                 startReview = ProgramStartReview(
                     program: machine.status.program,
                     workPosition: startPositionText,
-                    previewKey: machine.previewKey
+                    previewKey: machine.previewKey,
+                    blocks: savedBlocks
                 )
             } label: {
                 Label("Старт", systemImage: "play.fill")
@@ -159,13 +330,19 @@ struct ProgramView: View {
                 .disabled(machine.status.program.state != "running" || machine.status.isOnHold)
 
                 Button {
-                    Task { await machine.resumeProgram() }
+                    if machine.status.program.state == "interrupted" {
+                        showResumeConfirmation = true
+                    } else {
+                        Task { await machine.resumeProgram() }
+                    }
                 } label: {
                     Label("Продолжить", systemImage: "playpause.fill")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .disabled(machine.status.program.state != "running" || !machine.status.isOnHold)
+                .disabled(!machine.status.connected ||
+                          !(machine.status.program.state == "running" && machine.status.isOnHold ||
+                            machine.status.program.state == "interrupted" && machine.status.isIdle))
             }
 
             Button(role: .destructive) {
@@ -175,7 +352,8 @@ struct ProgramView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
-            .disabled(!machine.status.program.running)
+            .disabled(!machine.status.connected ||
+                      !(machine.status.program.running || machine.status.program.state == "interrupted"))
         }
     }
 
@@ -185,6 +363,12 @@ struct ProgramView: View {
                 Section("Выбранная программа") {
                     Text(review.program.name)
                     LabeledContent("Строк", value: review.program.lines.formatted())
+                }
+                if !review.blocks.before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Section("Предпрограмма") { Text(review.blocks.before).font(.body.monospaced()) }
+                }
+                if !review.blocks.after.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Section("Послепрограмма") { Text(review.blocks.after).font(.body.monospaced()) }
                 }
                 Section("Обязательные действия") {
                     Text("1. Проверьте крепление заготовки.")
@@ -197,11 +381,15 @@ struct ProgramView: View {
                 }
                 Section {
                     Button("Подтвердить и запустить") {
-                        guard canStart, review.previewKey == machine.previewKey else { return }
+                        guard canConfirm(review) else { return }
                         startReview = nil
-                        Task { await machine.startProgram() }
+                        starting = true
+                        Task {
+                            defer { starting = false }
+                            await machine.startProgram(blocksRevision: review.blocks.revision)
+                        }
                     }
-                    .disabled(!canStart || review.previewKey != machine.previewKey)
+                    .disabled(!canConfirm(review))
                 }
             }
             .navigationTitle("Запуск G-code")
@@ -215,7 +403,11 @@ struct ProgramView: View {
     }
 
     private var canStart: Bool {
-        machine.status.canStartProgram
+        machine.status.canStartProgram && canEditBlocks && !blocksDirty && !starting
+    }
+
+    private func canConfirm(_ review: ProgramStartReview) -> Bool {
+        canStart && review.previewKey == machine.previewKey && review.blocks == savedBlocks
     }
 
     private var startPositionText: String? {
@@ -231,7 +423,7 @@ struct ProgramView: View {
         switch machine.status.program.state {
         case "completed": return .green
         case "failed", "canceled": return .red
-        case "queued", "running": return .orange
+        case "queued", "running", "interrupted": return .orange
         default: return .secondary
         }
     }
@@ -241,8 +433,14 @@ private struct ProgramStartReview: Identifiable {
     let program: ProgramStatus
     let workPosition: String?
     let previewKey: String
+    let blocks: ProgramBlocks
 
     var id: String { previewKey }
+}
+
+private struct ManualGCodeReview {
+    let line: String
+    let source: String
 }
 
 private struct ToolpathView: View {
@@ -254,6 +452,7 @@ private struct ToolpathView: View {
 
     private var live: Bool {
         online && status.program.state == "running" && status.posLabel == "WPos" &&
+        (status.program.phase == nil || status.program.phase == "main") &&
         preview != nil && preview?.revision == status.program.revision
     }
     private var line: Int { live ? (status.program.currentLine ?? 0) : 0 }
@@ -328,8 +527,9 @@ private struct ToolpathGeometry {
 
     static func project(_ point: [Double]) -> CGPoint {
         guard point.count == 3 else { return .zero }
-        return CGPoint(x: (point[0] - point[1]) * 0.866,
-                       y: (point[0] + point[1]) * 0.5 - point[2])
+        // Screen Y points down. Keep the top view of the XY plane unmirrored.
+        return CGPoint(x: (point[0] + point[1]) * 0.866,
+                       y: (point[0] - point[1]) * 0.5 - point[2])
     }
 }
 

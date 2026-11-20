@@ -162,7 +162,7 @@ struct ControlView: View {
 
                 HStack {
                     Button { Task { await machine.home() } } label: {
-                        Label("Хоминг", systemImage: "house")
+                        Label("Домой", systemImage: "house")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)

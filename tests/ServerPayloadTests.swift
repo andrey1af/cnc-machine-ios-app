@@ -3,6 +3,42 @@ import XCTest
 @testable import CNCCore
 
 final class ServerPayloadTests: XCTestCase {
+    func testControllerSettingsUseBoardValuesAndKeepOnlyEditsWithUnchangedOriginals() throws {
+        func settings(feed: Int, delay: Int) throws -> [ControllerSettingGroup] {
+            let payload = """
+            [{"title":"Оси", "settings":[
+              {"id":"110", "label":"Скорость X", "unit":"мм/мин", "kind":"decimal", "min":1, "max":100000, "value":\(feed)},
+              {"id":"1", "label":"Задержка", "kind":"integer", "min":0, "max":255, "value":\(delay)},
+              {"id":"21", "label":"Концевики", "kind":"toggle", "min":0, "max":1, "value":1},
+              {"id":"28", "label":"Частота ШИМ", "kind":"decimal", "min":0, "max":100000, "value":null}
+            ]}]
+            """
+            return try JSONDecoder().decode([ControllerSettingGroup].self, from: Data(payload.utf8))
+        }
+
+        var draft = ControllerSettingsDraft()
+        draft.replace(with: try settings(feed: 500, delay: 25))
+        XCTAssertEqual(draft.values, ["110": "500", "1": "25", "21": "1"])
+        XCTAssertTrue(draft.edited.isEmpty)
+
+        draft.values["110"] = "450,5"
+        draft.values["1"] = "30"
+        XCTAssertEqual(draft.edited.map(\.id), ["110", "1"])
+        XCTAssertEqual(draft.edited.first?.parse("450,5"), 450.5)
+        XCTAssertNil(draft.edited.last?.parse("30,5"))
+        XCTAssertNil(draft.edited.last?.parse("256"))
+
+        draft.replace(with: try settings(feed: 480, delay: 25), keepingEdits: true)
+        XCTAssertEqual(draft.values, ["110": "480", "1": "30", "21": "1"])
+        XCTAssertEqual(draft.edited.map(\.id), ["1"])
+    }
+
+    func testControllerSettingChangeEncodesExpectedAndConfirmedValues() throws {
+        let data = try JSONEncoder().encode(["110": ControllerSettingChange(from: 500, to: 450.5)])
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: [String: Double]])
+        XCTAssertEqual(payload, ["110": ["from": 500, "to": 450.5]])
+    }
+
     func testStatusDecodesWorkCoordinatesAndProgramEstimate() throws {
         let json = """
         {

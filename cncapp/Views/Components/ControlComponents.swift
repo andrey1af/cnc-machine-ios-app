@@ -74,7 +74,7 @@ struct ConnectionBadge: View {
     private var color: Color {
         switch connection {
         case .connected: return .green
-        case .connecting: return .orange
+        case .connecting, .authenticationRequired: return .orange
         case .controllerOffline, .serverOffline: return .red
         }
     }
@@ -137,7 +137,7 @@ private struct ConnectionMenuButton: View {
     private var color: Color {
         switch machine.connection {
         case .connected: return .green
-        case .connecting: return .orange
+        case .connecting, .authenticationRequired: return .orange
         case .controllerOffline, .serverOffline: return .red
         }
     }
@@ -250,7 +250,7 @@ struct MachineStatusPanel: View {
     private var statusColor: Color {
         switch machine.connection {
         case .serverOffline, .controllerOffline: return .red
-        case .connecting: return .orange
+        case .connecting, .authenticationRequired: return .orange
         case .connected:
             if machine.status.isAlarm { return .red }
             return machine.status.isIdle ? .green : .orange

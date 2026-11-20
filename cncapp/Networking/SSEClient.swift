@@ -1,6 +1,6 @@
 import Foundation
 
-final class SSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+final class SSEClient: RejectRedirects, URLSessionDataDelegate, @unchecked Sendable {
     var onEvent: (@Sendable (_ event: String, _ data: String) -> Void)?
     var onDisconnect: (@Sendable (_ error: Error?) -> Void)?
 
@@ -12,15 +12,16 @@ final class SSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var stopped = false
 
-    func start(url: URL) {
+    func start(request: URLRequest) {
         stop()
         lock.withLock { stopped = false }
-        var request = URLRequest(url: url)
+        var request = request
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.timeoutInterval = 15
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
         let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
         configuration.timeoutIntervalForRequest = request.timeoutInterval
         configuration.timeoutIntervalForResource = .infinity
         let newSession = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
@@ -30,19 +31,37 @@ final class SSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     }
 
     func stop() {
-        lock.withLock { stopped = true }
+        lock.withLock {
+            stopped = true
+            buffer.removeAll(keepingCapacity: false)
+            currentEvent = "message"
+            currentData.removeAll(keepingCapacity: false)
+        }
         task?.cancel()
         task = nil
         session?.invalidateAndCancel()
         session = nil
-        buffer.removeAll(keepingCapacity: false)
-        currentEvent = "message"
-        currentData.removeAll(keepingCapacity: false)
+    }
+
+    func urlSession(
+        _ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+        completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
+    ) {
+        if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+            completionHandler(.allow)
+        } else {
+            let requiresPassword = (response as? HTTPURLResponse)?.statusCode == 401
+            notifyDisconnect(requiresPassword ? CNCClientError.authenticationRequired : CNCClientError.invalidResponse)
+            completionHandler(.cancel)
+        }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        buffer.append(data)
-        consumeCompleteLines()
+        lock.withLock {
+            guard !stopped else { return }
+            buffer.append(data)
+            consumeCompleteLines()
+        }
     }
 
     func urlSession(
@@ -50,7 +69,15 @@ final class SSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendable {
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
-        let shouldNotify = lock.withLock { !stopped }
+        notifyDisconnect(error)
+    }
+
+    private func notifyDisconnect(_ error: Error?) {
+        let shouldNotify = lock.withLock {
+            guard !stopped else { return false }
+            stopped = true
+            return true
+        }
         if shouldNotify { onDisconnect?(error) }
     }
 

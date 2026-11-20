@@ -27,6 +27,8 @@ final class LogStore: ObservableObject {
 
 @MainActor
 final class MachineViewModel: ObservableObject {
+    static let defaultServerAddress = "https://192.168.50.1:8443"
+
     @Published private(set) var status = MachineStatus.disconnected
     @Published private(set) var connection: ServerConnection = .connecting
     @Published private(set) var positionReceivedAt: Date?
@@ -37,10 +39,11 @@ final class MachineViewModel: ObservableObject {
 
     @Published private(set) var preview: ToolpathPreview?
     @Published private(set) var previewError: String?
-    @Published private(set) var previewEpoch = 0
+    @Published private(set) var serverEpoch = 0
     @Published private(set) var previewRenderVersion = 0
 
-    var previewKey: String { "\(client.baseURL)-\(previewEpoch)-\(status.program.revision ?? 0)" }
+    var previewKey: String { "\(client.baseURL)-\(serverEpoch)-\(status.program.revision ?? 0)" }
+    var activeServerURL: URL { client.baseURL }
 
     private var loadedPreviewKey: String?
 
@@ -79,8 +82,8 @@ final class MachineViewModel: ObservableObject {
     private var generation = UUID()
 
     init() {
-        let saved = UserDefaults.standard.string(forKey: "cnc.serverAddress") ?? "http://repka.local:8080"
-        let normalized = Self.normalizedAddress(saved) ?? "http://repka.local:8080"
+        let saved = UserDefaults.standard.string(forKey: "cnc.serverAddress") ?? Self.defaultServerAddress
+        let normalized = Self.normalizedAddress(saved) ?? Self.defaultServerAddress
         serverAddress = normalized
         client = CNCAPIClient(baseURL: URL(string: normalized)!)
     }
@@ -111,24 +114,47 @@ final class MachineViewModel: ObservableObject {
         status.connected = false
     }
 
-    @discardableResult
-    func applyServerAddress() -> Bool {
+    func applyServerAddress(password: String) async throws {
         guard let normalized = Self.normalizedAddress(serverAddress), let url = URL(string: normalized) else {
-            lastError = "Введите адрес вида http://repka.local:8080"
-            return false
+            throw CNCClientError.invalidAddress
         }
         let addressChanged = client.baseURL.absoluteString != normalized
+        let nextClient = addressChanged ? CNCAPIClient(baseURL: url) : client
+        if !password.isEmpty {
+            try await nextClient.signIn(password: password)
+        }
+        try Task.checkCancellation()
         serverAddress = normalized
         UserDefaults.standard.set(normalized, forKey: "cnc.serverAddress")
         if addressChanged {
-            client = CNCAPIClient(baseURL: url)
+            client = nextClient
             lastLogID = 0
             serverBoot = 0
             positionReceivedAt = nil
             logStore.clear()
         }
         connect()
-        return true
+    }
+
+    func cameraStream() throws -> CameraStreamClient.Stream { try client.cameraStream() }
+
+    func controllerSettings(changes: [String: ControllerSettingChange]? = nil) async throws -> [ControllerSettingGroup] {
+        let source = client
+        let epoch = serverEpoch
+        do {
+            return try await source.controllerSettings(changes: changes)
+        } catch CNCClientError.authenticationRequired {
+            if !Task.isCancelled, source.baseURL == activeServerURL, epoch == serverEpoch {
+                requireAuthentication()
+            }
+            throw CNCClientError.authenticationRequired
+        }
+    }
+
+    func requireAuthentication() {
+        disconnect()
+        endJog()
+        connection = .authenticationRequired
     }
 
     func dismissError() { lastError = nil }
@@ -226,7 +252,26 @@ final class MachineViewModel: ObservableObject {
         }
     }
 
-    func startProgram() async { await perform(path: "/api/program/start", action: "запуск программы") }
+    func startProgram(blocksRevision: String) async {
+        await perform(path: "/api/program/start", json: ["blocksRevision": blocksRevision], action: "запуск программы")
+    }
+
+    func executeGCode(_ line: String) async -> Bool {
+        await perform(path: "/api/gcode", json: ["line": line], action: "ручная команда G-code")
+    }
+
+    func programBlocks(saving blocks: ProgramBlocks? = nil) async throws -> ProgramBlocks {
+        let source = client
+        let epoch = serverEpoch
+        do {
+            return try await source.programBlocks(saving: blocks)
+        } catch CNCClientError.authenticationRequired {
+            if !Task.isCancelled, source.baseURL == activeServerURL, epoch == serverEpoch {
+                requireAuthentication()
+            }
+            throw CNCClientError.authenticationRequired
+        }
+    }
     func pauseProgram() async { await perform(path: "/api/program/pause", action: "пауза программы") }
     func resumeProgram() async { await perform(path: "/api/program/resume", action: "продолжение программы") }
     func cancelProgram() async { await perform(path: "/api/program/cancel", action: "отмена программы") }
@@ -258,7 +303,7 @@ final class MachineViewModel: ObservableObject {
     }
 
     private func startEventStream() {
-        guard let eventsURL = URL(string: "/api/events", relativeTo: client.baseURL)?.absoluteURL else {
+        guard let request = try? client.eventsRequest() else {
             lastError = "Некорректный адрес сервера"
             connection = .serverOffline
             return
@@ -274,14 +319,18 @@ final class MachineViewModel: ObservableObject {
                 self.receive(event: event, data: data)
             }
         }
-        stream.onDisconnect = { [weak self] _ in
+        stream.onDisconnect = { [weak self] error in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == currentGeneration else { return }
+                if case .authenticationRequired? = error as? CNCClientError {
+                    self.requireAuthentication()
+                    return
+                }
                 self.handleDisconnect()
             }
         }
         eventClient = stream
-        stream.start(url: eventsURL)
+        stream.start(request: request)
     }
 
     private func receive(event: String, data: String) {
@@ -293,7 +342,7 @@ final class MachineViewModel: ObservableObject {
                 addLocalLog(level: "INFO", message: "Сервер перезапущен")
                 lastLogID = 0
             }
-            if serverBoot != hello.boot { previewEpoch += 1 }
+            if serverBoot != hello.boot { serverEpoch += 1 }
             serverBoot = hello.boot
         case "log":
             guard let entry = try? JSONDecoder().decode(LogEntry.self, from: payload), entry.id > lastLogID else { return }
