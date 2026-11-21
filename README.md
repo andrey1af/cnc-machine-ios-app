@@ -4,6 +4,8 @@
 
 ## Скриншоты
 
+[Видео с демонстрация приложения](https://drive.google.com/drive/folders/1nSoP0y-EddFVDtQ9NPx9Sua8LuhKtXLR?usp=sharing)
+
 **Пульт и подключение**
 
 <p>
