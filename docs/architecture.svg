@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="406" viewBox="0 0 720 406" role="img" aria-labelledby="title description">
+  <title id="title">Архитектура CNC Пульта</title>
+  <desc id="description">Экраны SwiftUI связаны с MachineViewModel и сетевыми клиентами. По Wi-Fi приложение обменивается HTTP-запросами с cncbridge и получает события SSE и видео MJPEG. Сервер связан с контроллером GRBL и получает видео с USB-камеры.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L8 4L0 8Z" fill="#526981"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="718" height="404" rx="18" fill="#f7faff" stroke="#cbd8e6"/>
+  <g font-family="Arial, sans-serif" fill="#132c46" text-anchor="middle">
+    <text x="360" y="35" font-size="22" font-weight="700">Архитектура CNC Пульта</text>
+
+    <rect x="24" y="52" width="672" height="117" rx="12" fill="#e8f1ff" stroke="#a6bfdf"/>
+    <text x="360" y="77" font-size="16" font-weight="700">iOS-клиент</text>
+    <g fill="#ffffff" stroke="#a6bfdf">
+      <rect x="37" y="90" width="150" height="63" rx="8"/>
+      <rect x="218" y="90" width="195" height="63" rx="8"/>
+      <rect x="444" y="90" width="239" height="63" rx="8"/>
+    </g>
+    <g font-size="15" font-weight="700">
+      <text x="112" y="116">SwiftUI</text>
+      <text x="315.5" y="116">MachineViewModel</text>
+      <text x="563.5" y="116">Сетевые клиенты</text>
+    </g>
+    <g font-size="13" fill="#34516e">
+      <text x="112" y="137">Экраны</text>
+      <text x="315.5" y="137">Состояние и действия</text>
+      <text x="563.5" y="137">CNCAPIClient · SSEClient · камера</text>
+    </g>
+    <g stroke="#526981" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)">
+      <path d="M192 121H213"/>
+      <path d="M418 121H439"/>
+    </g>
+
+    <path d="M360 173V244" stroke="#526981" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <text x="346" y="200" text-anchor="end" font-size="14" font-weight="700">Wi-Fi · HTTPS / HTTP</text>
+    <text x="346" y="221" text-anchor="end" font-size="13" fill="#34516e">Команды, G-code, предпросмотр</text>
+    <text x="374" y="200" text-anchor="start" font-size="13" fill="#34516e">SSE · статус и журнал</text>
+    <text x="374" y="221" text-anchor="start" font-size="13" fill="#34516e">MJPEG · видео</text>
+
+    <rect x="166" y="248" width="388" height="58" rx="10" fill="#e8f4ef" stroke="#a3c6b7"/>
+    <text x="360" y="273" font-size="17" font-weight="700">cncbridge</text>
+    <text x="360" y="293" font-size="13" fill="#34516e">Сервер на Repka Pi</text>
+
+    <path d="M228 310V346" stroke="#526981" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+    <path d="M492 346V310" stroke="#526981" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <text x="241" y="332" text-anchor="start" font-size="13" fill="#34516e">USB</text>
+    <text x="505" y="332" text-anchor="start" font-size="13" fill="#34516e">USB</text>
+
+    <g fill="#ffffff" stroke="#c0cfdf">
+      <rect x="124" y="350" width="208" height="38" rx="8"/>
+      <rect x="388" y="350" width="208" height="38" rx="8"/>
+    </g>
+    <g font-size="15" font-weight="700">
+      <text x="228" y="374">Контроллер GRBL</text>
+      <text x="492" y="374">Камера</text>
+    </g>
+  </g>
+</svg>

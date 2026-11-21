@@ -1,0 +1,922 @@
+openapi: 3.0.0
+info:
+  title: cncbridge
+  description: |
+    API веб-пульта ручного управления ЧПУ-станком на контроллере MKS DLC32 (GRBL).
+
+    Команды выполняются по очереди. Пока станок занят предыдущей командой,
+    новая не принимается: jog отвечает 429, остальные команды — 409.
+    Stop и Reset отправляются в контроллер сразу, минуя очередь.
+
+    Каждый отказ, кроме 429 на jog, пишется в журнал и виден на странице
+    в потоке /api/events.
+  version: 1.0.0
+
+servers:
+  - url: https://192.168.50.1:8443
+  - url: http://repka.local:8080
+
+tags:
+  - name: control
+    description: Команды станку
+  - name: program
+    description: Загрузка и выполнение программ G-code
+  - name: events
+    description: Журнал и состояние станка для страницы
+  - name: health
+    description: Проверки состояния сервиса
+  - name: camera
+    description: Видео с USB-камеры в защищённом режиме
+
+paths:
+  /api/camera:
+    get:
+      tags: [camera]
+      summary: Проверить, включена ли камера в настройках
+      operationId: cameraEnabled
+      security:
+        - RepkaSession: []
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '401':
+          description: Требуется вход в веб-пульт
+        '404':
+          description: Камера отключена в настройках
+  /api/camera/stream:
+    get:
+      tags: [camera]
+      summary: Живое видео USB-камеры без звука
+      operationId: cameraStream
+      security:
+        - RepkaSession: []
+      responses:
+        '200':
+          description: Поток JPEG-кадров с разделителем MIME
+          content:
+            multipart/x-mixed-replace:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: Требуется вход в веб-пульт
+        '404':
+          description: Камера отключена в настройках
+        '503':
+          description: Камера недоступна или не отправила кадры
+  /api/program/preview:
+    get:
+      tags: [program]
+      summary: Геометрия 2.5D загруженной программы
+      description: |
+        Загружается один раз при изменении program.revision (включая запуск с новой начальной точкой).
+        Доступна без подключения контроллера. Начальные режимы G21 G90 G17 G0;
+        G0/G1, G2/G3 с I/J или R, G20/G21, G90/G91, начальный G10 L20 P1. Перед запуском начальная точка — 0,0,0,
+        при запуске — текущая WPos. При неподдерживаемой команде возвращается безопасный префикс и warning.
+      operationId: programPreview
+      responses:
+        '200':
+          description: Траектория; segments пуст, если программа не загружена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolpathPreview'
+  /api/jog:
+    post:
+      tags: [control]
+      summary: Сдвинуть ось на шаг
+      description: |
+        Сдвигает ось на текущий шаг (см. /api/settings) с текущей скоростью.
+        При удержании кнопки страница повторяет запрос несколько раз в секунду;
+        лишние запросы отбрасываются с кодом 429, поэтому станок не уезжает дальше,
+        чем держали кнопку.
+      operationId: jog
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JogRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          description: Станок выполняет предыдущее движение, запрос отброшен (в журнал не пишется)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/stop:
+    post:
+      tags: [control]
+      summary: Остановить jog
+      description: Отправляет realtime-команду Jog Cancel (0x85) в обход очереди.
+      operationId: stop
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/reset:
+    post:
+      tags: [control]
+      summary: Аварийная остановка
+      description: |
+        Soft-reset контроллера (0x18) в обход очереди: останавливает любое движение,
+        включая хоминг, и прерывает текущую команду.
+      operationId: reset
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/unlock:
+    post:
+      tags: [control]
+      summary: Снять блокировку
+      description: |
+        Отправляет `$X`. После аварий ALARM:1 и ALARM:2 GRBL принимает только
+        soft-reset, поэтому в этом случае контроллер сначала сбрасывается.
+      operationId: unlock
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/home:
+    post:
+      tags: [control]
+      summary: Хоминг
+      description: |
+        Ставит в очередь хоминг по Z+, X+, Y− с отдельным подтверждением каждой оси.
+        После успешного завершения выбирает G54 и обнуляет рабочие координаты XYZ.
+        Требуются настройки контроллера `$22=1` и `$23=2`. Результат приходит в журнал.
+      operationId: home
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/zero:
+    post:
+      tags: [control]
+      summary: Обнулить рабочие координаты
+      description: Ставит в очередь `G10 L20 P1 X0 Y0 Z0`.
+      operationId: zero
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/settings:
+    post:
+      tags: [control]
+      summary: Изменить шаг и скорость jog
+      description: Все поля проверяются и применяются атомарно. Скорость 0 означает «не менять». Настройки доступны без подключения контроллера и сохраняются при переподключении.
+      operationId: settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettingsRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/controller/settings:
+    get:
+      tags: [control]
+      summary: Считать текущее состояние настроек GRBL
+      description: Читает параметры напрямую с контроллера командой `$$`.
+      operationId: readControllerSettings
+      responses:
+        '200':
+          $ref: '#/components/responses/ControllerSettings'
+        '400':
+          description: Контроллер отклонил чтение или не вернул значений
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+    patch:
+      tags: [control]
+      summary: Записать подтверждённые параметры GRBL
+      description: |
+        Принимает только изменённые параметры. Сверяет `from` с текущими значениями
+        на плате перед записью и возвращает значения, прочитанные после записи.
+        При сбое записи часть значений может сохраниться. Выполните GET, чтобы
+        получить фактическую конфигурацию перед повторной записью.
+      operationId: updateControllerSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              additionalProperties:
+                type: object
+                required: [from, to]
+                properties:
+                  from:
+                    type: number
+                  to:
+                    type: number
+            example:
+              '110': {from: 500, to: 450}
+      responses:
+        '200':
+          $ref: '#/components/responses/ControllerSettings'
+        '400':
+          description: Неверное значение, отказ прошивки или расхождение при проверке
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Станок занят или исходные параметры уже изменились на плате
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/program:
+    post:
+      tags: [program]
+      summary: Загрузить программу G-code
+      description: |
+        Тело запроса — текст файла G-code (не больше 10 МБ). Сервер удаляет
+        комментарии `(…)` и `;…`, пустые строки и `%` и хранит программу
+        до следующей загрузки или перезапуска. Связь с контроллером не нужна.
+        Пока программа выполняется, новую загрузить нельзя (409).
+      operationId: programUpload
+      parameters:
+        - name: name
+          in: query
+          description: Имя файла для отображения
+          schema:
+            type: string
+            example: circle_r15.gcode
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+              example: "G21 G90\nG0 X10 Y0\nG2 X10 Y0 I-10 J0 F600\n"
+      responses:
+        '200':
+          description: Программа загружена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProgramResponse'
+        '400':
+          description: Ошибка разбора файла (номер строки — в `details`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                message: "команда не выполнена: загрузка программы"
+                details: "строка 12: незакрытый комментарий в скобках"
+        '409':
+          $ref: '#/components/responses/Busy'
+        '413':
+          description: Файл больше 10 МБ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/gcode:
+    post:
+      tags: [program]
+      summary: Поставить одну ручную строку G-code в очередь
+      description: Принимается при Idle. Результат выполнения появляется в журнале. Загруженный файл сохраняется.
+      operationId: executeGCode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [line]
+              properties:
+                line:
+                  type: string
+                  maxLength: 255
+                  example: G4 P0.1
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/program/blocks:
+    get:
+      tags: [program]
+      summary: Считать сохранённые пред- и послепрограмму
+      operationId: readProgramBlocks
+      responses:
+        '200':
+          $ref: '#/components/responses/ProgramBlocks'
+        '500':
+          description: Файл настроек недоступен
+    put:
+      tags: [program]
+      summary: Сохранить пред- и послепрограмму
+      description: Передайте revision, полученный при чтении. Пустые блоки пропускаются. Предел каждого блока — 8192 байта.
+      operationId: saveProgramBlocks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProgramBlocks'
+      responses:
+        '200':
+          $ref: '#/components/responses/ProgramBlocks'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Идёт выполнение или revision устарел
+        '500':
+          description: Файл настроек недоступен
+
+  /api/program/start:
+    post:
+      tags: [program]
+      summary: Запустить загруженную программу
+      description: |
+        Ставит программу в очередь. Строки отправляются по одной, следующая —
+        после `ok` на предыдущую; ход выполнения — в `Status.program`.
+        При ошибке GRBL программа останавливается (feed hold и soft-reset),
+        номер строки пишется в журнал. Пока программа выполняется, остальные
+        команды очереди (jog, хоминг, `$X`, обнуление) не принимаются.
+        Выполняет сохранённую предпрограмму, загруженный файл и послепрограмму
+        последовательно. Каждый следующий этап начинается после завершения предыдущего.
+      operationId: programStart
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                blocksRevision:
+                  type: string
+                  description: Версия блоков, показанных оператору при подтверждении запуска
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Busy'
+        '500':
+          description: Файл пред- и послепрограммы недоступен
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/program/pause:
+    post:
+      tags: [program]
+      summary: Пауза программы
+      description: Feed hold (`!`) в обход очереди.
+      operationId: programPause
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '409':
+          $ref: '#/components/responses/NotRunning'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/program/resume:
+    post:
+      tags: [program]
+      summary: Продолжить программу после паузы или переподключения
+      description: |
+        Для работающей программы отправляет cycle start (`~`).
+        Для состояния interrupted ставит продолжение в очередь после явного действия оператора.
+        Пульт проверяет смещение G54 и повторяет проход с resumeLine.
+      operationId: programResume
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '409':
+          $ref: '#/components/responses/NotRunning'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/program/cancel:
+    post:
+      tags: [program]
+      summary: Отменить программу
+      description: |
+        Прекращает отправку строк, плавно останавливает станок (feed hold)
+        и после остановки делает soft-reset, чтобы очистить буфер движения.
+        Координаты при этом сохраняются.
+      operationId: programCancel
+      responses:
+        '200':
+          $ref: '#/components/responses/OK'
+        '409':
+          $ref: '#/components/responses/NotRunning'
+        '503':
+          $ref: '#/components/responses/NotConnected'
+
+  /api/events:
+    get:
+      tags: [events]
+      summary: Поток событий для страницы (SSE)
+      description: |
+        Server-Sent Events. Сразу после подключения сервер отправляет:
+
+        1. `hello` — `HelloEvent`;
+        2. `log` — сохранённые записи журнала (до 1000), по одной на событие, `LogEntry`;
+        3. `status` — текущее состояние станка, `Status`.
+
+        Дальше приходят новые записи `log`, а `status` — каждые 5 секунд.
+        Поток закрывается при остановке сервера.
+
+        Пример:
+
+        ```
+        event: hello
+        data: {"boot":1794301930455875000}
+
+        event: log
+        data: {"id":1,"time":"2026-11-10T12:12:10.455954+03:00","level":"INFO","msg":"контроллер подключён","attrs":"state=Idle"}
+
+        event: status
+        data: {"connected":true,"state":"Idle","pos":[0,0,0],"posLabel":"WPos",...}
+        ```
+      operationId: events
+      responses:
+        '200':
+          description: Поток событий
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /health:
+    get:
+      tags: [health]
+      summary: Процесс жив
+      operationId: liveness
+      responses:
+        '200':
+          description: Процесс отвечает на запросы
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+              example:
+                status: ok
+
+  /ready:
+    get:
+      tags: [health]
+      summary: Сервис готов принимать запросы
+      description: Не зависит от связи с контроллером — её показывает поле `connected` в `Status`.
+      operationId: readiness
+      responses:
+        '200':
+          description: Сервис готов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+              example:
+                status: ready
+        '503':
+          description: Сервис запускается или останавливается
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+              example:
+                status: not ready
+
+  /:
+    get:
+      summary: Страница управления
+      operationId: page
+      responses:
+        '200':
+          description: HTML-страница
+          content:
+            text/html:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    RepkaSession:
+      type: apiKey
+      in: cookie
+      name: __Host-repka_session
+  responses:
+    ProgramBlocks:
+      description: Сохранённый текст пред- и послепрограммы
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProgramBlocks'
+    ControllerSettings:
+      description: Группы настроек и их текущие значения. Для параметров, отсутствующих в прошивке, value равен null.
+      content:
+        application/json:
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/ControllerSettingGroup'
+    OK:
+      description: Команда принята
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StatusResponse'
+          example:
+            status: ok
+    BadRequest:
+      description: Некорректный запрос или ошибка записи в порт
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: "команда не выполнена: jog"
+            details: "неизвестная ось \"A\""
+    Busy:
+      description: Станок выполняет предыдущую команду, новая не принята
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: "команда не выполнена: хоминг"
+            details: "контроллер занят предыдущей командой"
+    NotRunning:
+      description: Программа не выполняется
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: "команда не выполнена: пауза программы"
+            details: "программа не выполняется"
+    NotConnected:
+      description: Контроллер не подключён, сервер повторяет подключение
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: "команда не выполнена: хоминг"
+            details: "нет связи с контроллером"
+
+  schemas:
+    ProgramBlocks:
+      type: object
+      required: [before, after, revision]
+      properties:
+        before:
+          type: string
+        after:
+          type: string
+        revision:
+          type: string
+    ControllerSettingGroup:
+      type: object
+      required: [title, settings]
+      properties:
+        title:
+          type: string
+        settings:
+          type: array
+          items:
+            type: object
+            required: [id, label, kind, min, max, value]
+            properties:
+              id:
+                type: string
+                example: '110'
+              label:
+                type: string
+              unit:
+                type: string
+              kind:
+                type: string
+                enum: [toggle, integer, decimal]
+              min:
+                type: number
+              max:
+                type: number
+              value:
+                type: number
+                nullable: true
+    Axis:
+      type: string
+      enum: [X, Y, Z]
+      example: X
+
+    JogRequest:
+      type: object
+      required: [axis, dir]
+      properties:
+        axis:
+          $ref: '#/components/schemas/Axis'
+        dir:
+          type: number
+          enum: [-1, 1]
+          description: Направление движения
+          example: 1
+
+    SettingsRequest:
+      type: object
+      properties:
+        step:
+          type: number
+          minimum: 0.1
+          maximum: 50
+          description: Шаг jog, мм
+          example: 1
+        feedXY:
+          type: number
+          minimum: 0
+          maximum: 300
+          description: Скорость jog по X/Y, мм/мин; 0 — не менять
+          example: 300
+        feedZ:
+          type: number
+          minimum: 0
+          maximum: 300
+          description: Скорость jog по Z, мм/мин; 0 — не менять
+          example: 100
+
+    Status:
+      type: object
+      description: Без связи с контроллером connected=false; настройки, выбранная программа и результат последнего запуска сохраняются до перезапуска приложения.
+      required: [connected, state, pos, posLabel, pins, step, feedXY, feedZ, maxFeedXY, maxFeedZ, program]
+      properties:
+        connected:
+          type: boolean
+          description: Контроллер подключён
+        state:
+          type: string
+          description: Состояние GRBL
+          example: Idle
+        pos:
+          type: array
+          description: Координаты X, Y, Z, мм
+          minItems: 3
+          maxItems: 3
+          items:
+            type: number
+          example: [10.5, 0, -2]
+        posLabel:
+          type: string
+          enum: ["", WPos, MPos]
+          description: WPos — рабочие координаты; MPos — машинные, пока смещение WCO не получено
+        pins:
+          type: string
+          description: Сработавшие концевики, например `XZ`; пусто — ни одного
+          example: ""
+        step:
+          type: number
+          minimum: 0.1
+          maximum: 50
+          description: Шаг jog, мм
+        feedXY:
+          type: number
+          minimum: 1
+          maximum: 300
+          description: Скорость jog по X/Y, мм/мин
+        feedZ:
+          type: number
+          minimum: 1
+          maximum: 300
+          description: Скорость jog по Z, мм/мин
+        maxFeedXY:
+          type: number
+          description: Верх шкалы скорости X/Y (из `$110`, `$111`)
+        maxFeedZ:
+          type: number
+          description: Верх шкалы скорости Z (из `$112`)
+        program:
+          $ref: '#/components/schemas/ProgramStatus'
+        lastRun:
+          description: Результат последнего завершённого запуска; сохраняется при загрузке нового файла
+          allOf:
+            - $ref: '#/components/schemas/ProgramStatus'
+
+    ToolpathPreview:
+      type: object
+      required: [revision, segments, warning]
+      properties:
+        revision:
+          type: integer
+          format: uint64
+        warning:
+          type: string
+        segments:
+          type: array
+          maxItems: 150000
+          items:
+            type: object
+            required: [line, command, text, rapid, points]
+            properties:
+              line:
+                type: integer
+                description: Номер строки исходного файла
+              command:
+                type: integer
+                description: Индекс отправляемой команды, начиная с 1
+              text:
+                type: string
+              rapid:
+                type: boolean
+              points:
+                type: array
+                items:
+                  type: array
+                  minItems: 3
+                  maxItems: 3
+                  items:
+                    type: number
+
+    ProgramStatus:
+      type: object
+      description: Выбранная программа и её жизненный цикл. Состояние queued резервирует программу сразу при принятии запуска.
+      required: [id, name, lines, sent, running, state, lastLine, revision, currentLine, currentText, completed, elapsedSeconds, remainingSeconds]
+      properties:
+        revision:
+          type: integer
+          format: uint64
+          description: Версия геометрии; меняется при загрузке файла и при запуске от WPos
+        currentLine:
+          type: integer
+          description: Приблизительная выполняемая строка по WPos, в пределах уже передаваемых команд; 0 если не определена. На пересечениях и коротких участках возможна погрешность.
+        resumeLine:
+          type: integer
+          description: Начало прохода для ручного продолжения после переподключения.
+        currentText:
+          type: string
+          description: Текст currentLine без комментариев
+        completed:
+          type: integer
+          description: Приблизительно пройденных команд по положению инструмента; обновляется раз в минуту
+        elapsedSeconds:
+          type: integer
+          format: int64
+          description: Прошедшее время на момент последнего минутного расчёта
+        remainingSeconds:
+          type: integer
+          format: int64
+          nullable: true
+          description: Приблизительное оставшееся время; null до первой минуты или без определённого прогресса
+        name:
+          type: string
+          description: Имя файла; пусто — программа не загружена
+          example: circle_r15.gcode
+        lines:
+          type: integer
+          description: Команд в программе (без комментариев и пустых строк)
+          example: 10
+        sent:
+          type: integer
+          description: Команд принято контроллером; движение по ним может ещё идти
+          example: 4
+        running:
+          type: boolean
+          description: Программа ожидает запуска или выполняется; пауза определяется состоянием GRBL Hold
+        id:
+          type: integer
+          format: uint64
+          description: Уникальный номер запуска в пределах сеанса; 0 до первого запуска выбранного файла
+        state:
+          type: string
+          enum: ["", loaded, queued, running, completed, canceled, failed, interrupted]
+        phase:
+          type: string
+          enum: [before, main, after]
+          description: Этап текущего или последнего запуска
+        lastLine:
+          type: integer
+          description: Последняя принятая исходная строка или строка ошибки
+        error:
+          type: string
+          description: Причина ошибки или отмены
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+
+    ProgramResponse:
+      type: object
+      required: [name, lines]
+      properties:
+        name:
+          type: string
+          example: circle_r15.gcode
+        lines:
+          type: integer
+          example: 10
+
+    LogEntry:
+      type: object
+      required: [id, time, level, msg]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Номер записи с начала запуска; по нему страница пропускает уже показанные записи
+          example: 42
+        time:
+          type: string
+          format: date-time
+        level:
+          type: string
+          enum: [DEBUG, INFO, WARN, ERROR]
+        msg:
+          type: string
+          example: контроллер подключён
+        attrs:
+          type: string
+          description: Атрибуты записи в виде key=value
+          example: state=Idle
+
+    HelloEvent:
+      type: object
+      required: [boot]
+      properties:
+        boot:
+          type: integer
+          format: int64
+          description: Момент запуска сервера (Unix, нс); если изменился — сервер перезапущен
+          example: 1794301930455875000
+
+    StatusResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+
+    ErrorResponse:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          description: Какая команда не выполнена
+          example: "команда не выполнена: jog"
+        details:
+          type: string
+          description: Причина
+          example: нет связи с контроллером
